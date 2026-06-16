@@ -1,0 +1,184 @@
+name: "Terraform CI — Validate & Security Scan"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "terraform/**"
+  push:
+    branches: [ "main" ]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  TF_VERSION:   "1.7.5"
+  TFSEC_VERSION: "latest"
+
+jobs:
+  # ─── Job 1: Terraform Format Check ─────────────────────────────────────────
+  terraform-fmt:
+    name: "Terraform Format"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check (azure-vm)
+        id: fmt-vm
+        run: terraform fmt -check -recursive
+        working-directory: terraform/azure-vm
+        continue-on-error: true
+
+      - name: Terraform Format Check (azure-monitor)
+        id: fmt-monitor
+        run: terraform fmt -check -recursive
+        working-directory: terraform/azure-monitor
+        continue-on-error: true
+
+      - name: Comment fmt results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fmtVm      = '${{ steps.fmt-vm.outcome }}';
+            const fmtMonitor = '${{ steps.fmt-monitor.outcome }}';
+            const icon = (s) => s === 'success' ? '✅' : '❌';
+            const body = [
+              '## 🔍 Terraform Format Check',
+              '',
+              '| Module | Result |',
+              '|--------|--------|',
+              `| terraform/azure-vm | ${icon(fmtVm)} ${fmtVm} |`,
+              `| terraform/azure-monitor | ${icon(fmtMonitor)} ${fmtMonitor} |`,
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ─── Job 2: Terraform Validate ──────────────────────────────────────────────
+  terraform-validate:
+    name: "Terraform Validate"
+    runs-on: ubuntu-latest
+    needs: terraform-fmt
+
+    strategy:
+      matrix:
+        module: [ "azure-vm", "azure-monitor" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init — ${{ matrix.module }}
+        run: terraform init -backend=false
+        working-directory: terraform/${{ matrix.module }}
+
+      - name: Terraform Validate — ${{ matrix.module }}
+        id: validate
+        run: terraform validate -json | tee validate-output.json
+        working-directory: terraform/${{ matrix.module }}
+
+      - name: Upload validation output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validate-${{ matrix.module }}
+          path: terraform/${{ matrix.module }}/validate-output.json
+
+  # ─── Job 3: tfsec Security Scan ─────────────────────────────────────────────
+  tfsec:
+    name: "tfsec Security Scan"
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform
+          version: ${{ env.TFSEC_VERSION }}
+          format: sarif
+          additional_args: "--out tfsec-results.sarif"
+
+      - name: Upload SARIF results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+
+      - name: Upload tfsec SARIF artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfsec-sarif
+          path: tfsec-results.sarif
+
+  # ─── Job 4: Terraform Plan (dry-run without credentials) ────────────────────
+  terraform-plan:
+    name: "Terraform Plan (dry-run)"
+    runs-on: ubuntu-latest
+    needs: tfsec
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init — azure-vm
+        run: terraform init -backend=false
+        working-directory: terraform/azure-vm
+
+      - name: Terraform Plan — azure-vm (dry-run)
+        id: plan
+        run: |
+          terraform plan -no-color -var="admin_password=DryRunPassword123!" 2>&1 | tee plan-output.txt || true
+        working-directory: terraform/azure-vm
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Comment plan output on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.existsSync('terraform/azure-vm/plan-output.txt')
+              ? fs.readFileSync('terraform/azure-vm/plan-output.txt', 'utf8').slice(0, 3000)
+              : 'Plan output not available';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📋 Terraform Plan\n\`\`\`hcl\n${plan}\n\`\`\``
+            });
