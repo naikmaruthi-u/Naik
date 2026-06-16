@@ -16,7 +16,7 @@
 | **IaC** | Terraform, ARM Templates, Bicep |
 | **Scripting** | PowerShell, Bash, Python |
 | **CI/CD** | GitHub Actions, Azure DevOps Pipelines |
-| **Monitoring** | Azure Monitor, Log Analytics, Grafana |
+| **Monitoring** | Azure Monitor, Log Analytics, Opsview, NewRelic |
 | **OS** | Windows Server 2016/2019/2022, RHEL, Ubuntu |
 | **Security** | Microsoft Defender for Cloud, tfsec, Azure Policy |
 
